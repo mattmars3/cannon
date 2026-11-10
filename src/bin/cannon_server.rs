@@ -23,16 +23,17 @@ use uuid::Uuid;
 type UploadResult<T> = Result<T, (StatusCode, &'static str)>;
 
 struct CannonServerState {
-    conn: rusqlite::Connection,
+    conn: Mutex<rusqlite::Connection>,
     api_key: String,
 }
 
 impl CannonServerState {
-    pub fn new() -> Arc<Mutex<CannonServerState>> {
-        let conn = Connection::open(CANNON_DB_PATH).expect("Unable to open database path");
+    pub fn new() -> Arc<CannonServerState> {
+        let conn =
+            Mutex::new(Connection::open(CANNON_DB_PATH).expect("Unable to open database path"));
         let api_key = env::var("CANNON_API_KEY")
             .expect("Must specify CANNON_API_KEY as an environment variable");
-        Arc::new(Mutex::new(Self { conn, api_key }))
+        Arc::new(Self { conn, api_key })
     }
 }
 
@@ -58,7 +59,7 @@ async fn main() {
         .expect("Unable to start server.");
 }
 
-async fn user_is_authenticated(state: Arc<Mutex<CannonServerState>>, headers: &HeaderMap) -> bool {
+async fn user_is_authenticated(state: Arc<CannonServerState>, headers: &HeaderMap) -> bool {
     let Ok(provided_api_key) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -69,11 +70,11 @@ async fn user_is_authenticated(state: Arc<Mutex<CannonServerState>>, headers: &H
     };
 
     // TODO: Confirm this is absolutely secure
-    state.lock().await.api_key == provided_api_key
+    state.api_key == provided_api_key
 }
 
 async fn upload_file(
-    State(state): State<Arc<Mutex<CannonServerState>>>,
+    State(state): State<Arc<CannonServerState>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     body: Body,
@@ -182,15 +183,14 @@ async fn stream_to_local_file(body: Body) -> UploadResult<(String, u64)> {
 }
 
 async fn store_file_record_in_db(
-    state: Arc<Mutex<CannonServerState>>,
+    state: Arc<CannonServerState>,
     uuid: &str,
     filename: &str,
     delete_on_download: bool,
 ) -> rusqlite::Result<usize> {
     let now = chrono::Local::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
-    let guard = state.lock().await;
 
-    guard.conn.execute(
+    state.conn.lock().await.execute(
         "INSERT INTO cannon (uuid, filename, uploaded_at, delete_on_download) VALUES (?1, ?2, ?3, ?4)",
         (uuid, filename, now, delete_on_download),
     )
@@ -204,10 +204,11 @@ fn create_db_file_if_not_exists() {
     }
 }
 
-async fn create_table_if_not_exists(state: Arc<Mutex<CannonServerState>>) {
-    let guard = state.lock().await;
-    guard
+async fn create_table_if_not_exists(state: Arc<CannonServerState>) {
+    state
         .conn
+        .lock()
+        .await
         .execute(
             "
 CREATE TABLE IF NOT EXISTS cannon (
@@ -223,14 +224,14 @@ delete_on_download INTEGER NOT NULL CHECK (delete_on_download IN (0, 1))
 }
 
 async fn get_file(
-    State(state): State<Arc<Mutex<CannonServerState>>>,
+    State(state): State<Arc<CannonServerState>>,
     Path(uuid): Path<String>,
 ) -> Result<Response, (StatusCode, &'static str)> {
     let row = {
-        let state = state.lock().await;
-
         state
             .conn
+            .lock()
+            .await
             .query_row(
                 "SELECT uuid, filename, delete_on_download
                  FROM cannon
