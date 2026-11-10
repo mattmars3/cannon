@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::Body,
     extract::{Path, Query, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
@@ -10,8 +10,8 @@ use cannon::*;
 use futures_util::TryStreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rusqlite::{Connection, OptionalExtension};
-use std::sync::Arc;
 use std::{collections::HashMap, path::PathBuf};
+use std::{env, sync::Arc};
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt},
@@ -24,12 +24,15 @@ type UploadResult<T> = Result<T, (StatusCode, &'static str)>;
 
 struct CannonServerState {
     conn: rusqlite::Connection,
+    api_key: String,
 }
 
 impl CannonServerState {
     pub fn new() -> Arc<Mutex<CannonServerState>> {
         let conn = Connection::open(CANNON_DB_PATH).expect("Unable to open database path");
-        Arc::new(Mutex::new(Self { conn }))
+        let api_key = env::var("CANNON_API_KEY")
+            .expect("Must specify CANNON_API_KEY as an environment variable");
+        Arc::new(Mutex::new(Self { conn, api_key }))
     }
 }
 
@@ -55,11 +58,31 @@ async fn main() {
         .expect("Unable to start server.");
 }
 
+async fn user_is_authenticated(state: Arc<Mutex<CannonServerState>>, headers: &HeaderMap) -> bool {
+    let Ok(provided_api_key) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(false)
+    else {
+        return false;
+    };
+
+    // TODO: Confirm this is absolutely secure
+    state.lock().await.api_key == provided_api_key
+}
+
 async fn upload_file(
     State(state): State<Arc<Mutex<CannonServerState>>>,
+    headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     body: Body,
 ) -> UploadResult<impl IntoResponse> {
+    // check the API key here
+    if !user_is_authenticated(state.clone(), &headers).await {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid credentials"));
+    }
+
     let delete_on_download: bool = match params.get(DELETE_ON_DOWNLOAD_QUERY_PARAM_NAME) {
         Some(delete_on_download) => {
             let Ok(delete_on_download) = delete_on_download.parse::<bool>() else {

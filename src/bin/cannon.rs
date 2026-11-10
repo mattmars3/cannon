@@ -22,6 +22,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let server_env = std::env::var("CANNON_SERVER");
     let api_key_env = std::env::var("CANNON_API_KEY");
 
+    // TODO: this is inverted, the command line args should take precendence over the env vars
     let server: String = match server_env {
         Ok(server) => server,
         Err(_) => args
