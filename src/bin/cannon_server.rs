@@ -1,7 +1,7 @@
 use axum::{
     Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -10,7 +10,10 @@ use cannon::*;
 use futures_util::TryStreamExt;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rusqlite::{Connection, OptionalExtension};
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use std::{env, sync::Arc};
 use tokio::{
     fs::{self, OpenOptions},
@@ -25,30 +28,41 @@ type UploadResult<T> = Result<T, (StatusCode, &'static str)>;
 struct CannonServerState {
     conn: Mutex<rusqlite::Connection>,
     api_key: String,
+    files_dir: PathBuf,
 }
 
 impl CannonServerState {
-    pub fn new() -> Arc<CannonServerState> {
+    pub fn new(data_dir: &std::path::Path) -> CannonServerState {
         let conn =
-            Mutex::new(Connection::open(CANNON_DB_PATH).expect("Unable to open database path"));
+            Mutex::new(Connection::open(db_path(data_dir)).expect("Unable to open database path"));
         let api_key = env::var("CANNON_API_KEY")
             .expect("Must specify CANNON_API_KEY as an environment variable");
-        Arc::new(Self { conn, api_key })
+        Self {
+            conn,
+            api_key,
+            files_dir: files_dir(data_dir),
+        }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    create_db_file_if_not_exists();
-    let cannon_server_state = CannonServerState::new();
+    let data_dir = data_dir().expect("Failed to get data directory");
+    let files = files_dir(&data_dir);
+    let _ = std::fs::create_dir_all(&files);
+    create_db_file_if_not_exists(&db_path(&data_dir));
+
+    let cannon_server_state = Arc::new(CannonServerState::new(&data_dir));
     create_table_if_not_exists(cannon_server_state.clone()).await;
+    // TODO: remove stale tempfiles here
 
     let app = Router::new()
         .route("/{uuid}", get(get_file))
         .route("/", put(upload_file))
         .with_state(cannon_server_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let bind = std::env::var("CANNON_BIND").unwrap_or_else(|_| "0.0.0.0:3000".into());
+    let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .expect("Unable to listen on specified port.");
 
@@ -69,7 +83,7 @@ async fn user_is_authenticated(state: Arc<CannonServerState>, headers: &HeaderMa
         return false;
     };
 
-    // TODO: Confirm this is absolutely secure
+    // TODO: Switch to constant-time comparison
     state.api_key == provided_api_key
 }
 
@@ -97,7 +111,7 @@ async fn upload_file(
         None => DELETE_ON_DOWNLOAD_DEFAULT,
     };
 
-    let (uuid, bytes) = match stream_to_local_file(body).await {
+    let (uuid, bytes) = match stream_to_local_file(&state.files_dir, body).await {
         Ok((uuid, bytes)) => (uuid, bytes),
         Err((status, err_msg)) => {
             let generic_err_msg = "Unable to stream payload to local file";
@@ -122,10 +136,10 @@ async fn upload_file(
     return Ok(uuid);
 }
 
-async fn stream_to_local_file(body: Body) -> UploadResult<(String, u64)> {
+async fn stream_to_local_file(data_path: &Path, body: Body) -> UploadResult<(String, u64)> {
     let uuid = Uuid::new_v4().to_string();
-    let temp_path = PathBuf::from(CANNON_DATA_PATH).join(format!("{uuid}.tmp"));
-    let final_path = PathBuf::from(CANNON_DATA_PATH).join(&uuid);
+    let temp_path = PathBuf::from(data_path).join(format!("{uuid}.tmp"));
+    let final_path = PathBuf::from(data_path).join(&uuid);
 
     let mut file = OpenOptions::new()
         .write(true)
@@ -196,10 +210,9 @@ async fn store_file_record_in_db(
     )
 }
 
-fn create_db_file_if_not_exists() {
-    let p = PathBuf::from(CANNON_DB_PATH);
+fn create_db_file_if_not_exists(db_path: &Path) {
+    let p = PathBuf::from(db_path);
     if !p.exists() {
-        println!("Database file does not exist. Creating {}", CANNON_DB_PATH);
         std::fs::File::create(p).expect("Unable to create database file");
     }
 }
@@ -223,9 +236,10 @@ delete_on_download INTEGER NOT NULL CHECK (delete_on_download IN (0, 1))
         .expect("Unable to run initial database check");
 }
 
+/// Route to actually fetch the files, using a path parameter for the uuid of the file.
 async fn get_file(
     State(state): State<Arc<CannonServerState>>,
-    Path(uuid): Path<String>,
+    axum::extract::Path(uuid): axum::extract::Path<String>,
 ) -> Result<Response, (StatusCode, &'static str)> {
     let row = {
         state
@@ -255,7 +269,7 @@ async fn get_file(
     };
 
     // stream the file to the user
-    let file_path = PathBuf::from(CANNON_DATA_PATH).join(&uuid);
+    let file_path = state.files_dir.clone().join(&uuid);
     let file = tokio::fs::File::open(&file_path)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "File not found but should exist"))?;
