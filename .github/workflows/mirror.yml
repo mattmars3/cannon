@@ -20,5 +20,5 @@ jobs:
         id: mirror
         uses: bridgelightcloud/github-mirror-action@v3
         with:
-          origin: 'https://git.mattmarsico.com/mattmarsico/cannon'
+          origin: 'https://git.mattmarsico.com/mm/cannon'
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
